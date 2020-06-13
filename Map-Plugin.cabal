@@ -1,0 +1,57 @@
+cabal-version:  2.4
+name:           Map-Plugin
+version:        0.1.0.0
+synopsis:       Type-checking plugin for type-level maps.
+license:        BSD-3-Clause
+build-type:     Simple
+author:         Sam Derbyshire
+maintainer:     Sam Derbyshire
+copyright:      2020 Sam Derbyshire
+
+common common
+
+  build-depends:
+    base
+      ^>= 4.14.0,
+    ghc
+      ^>= 8.11.0
+
+  default-language:
+    Haskell2010
+
+  ghc-options:
+    -O2
+    -fspecialise-aggressively
+    -fexpose-all-unfoldings
+    -Wall
+    -Wcompat
+    -fwarn-missing-local-signatures
+    -fwarn-incomplete-uni-patterns
+    -fwarn-missing-deriving-strategies
+    -fno-warn-unticked-promoted-constructors
+
+library
+
+  import:
+    common
+
+  hs-source-dirs:
+    plugin/src
+
+  exposed-modules:
+    Data.Type.Map,
+    MapPlugin
+
+library Map-Plugin-Example
+  
+  import:
+    common
+
+  hs-source-dirs:
+    examples/src
+
+  exposed-modules:
+    Plugin.Example
+
+  build-depends:
+    Map-Plugin
