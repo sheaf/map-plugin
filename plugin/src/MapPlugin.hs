@@ -269,7 +269,7 @@ isElement pluginDefs@( PluginDefs { .. } ) givens k0 kvs0 =
 isListElement :: PluginDefs -> [ GHC.Ct ] -> GHC.Type -> GHC.Type -> GHC.TcPluginM ( Maybe Element )
 isListElement ( PluginDefs {} ) _givens _k _list = pure Nothing -- TODO
 
--- | Computes whether two types are equal.
+-- | Computes whether `lhs == rhs`.
 --
 --  - @ Just True @: types are equal,
 --  - @ Just False @: types are apart,

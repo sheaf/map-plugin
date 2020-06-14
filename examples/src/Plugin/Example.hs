@@ -9,6 +9,8 @@
 module Plugin.Example where
 
 -- base
+import Data.Proxy
+  ( Proxy )
 import Data.Type.Equality
   ( type (==) )
 
@@ -24,36 +26,59 @@ data Dict ct where
 --------------------------------------------------------------------------------
 -- Should type-check.
 
-pass1 :: ( m ~ Insert k v s, Lookup k s ~ Nothing )
-      => Dict ( Lookup k m ~ Just v )
-pass1 = Dict
+-- @ Lookup k ( Insert k v m ) = Just v @
+pass1 :: ( s ~ Insert k v m, Lookup k m ~ Nothing )
+      => Proxy k -> Proxy v -> Proxy m -> Proxy s
+      -> Dict ( Lookup k s ~ Just v )
+pass1 _ _ _ _ = Dict
 
-pass2 :: ( m ~ Delete l ( Insert k v s ), Lookup k s ~ 'Nothing, ( k == l ) ~ 'False )
-      => Dict ( Lookup k m ~ Just v )
-pass2 = Dict
+-- @ Lookup k ( Delete l m ) = Lookup k m @ if @ l /= k@.
+pass2 :: ( s ~ Delete l m, ( k == l ) ~ 'False )
+      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      -> Dict ( Lookup k s ~ Lookup k m )
+pass2 _ _ _ _ = Dict
 
-pass3 :: ( m ~ Insert k v ( Delete k s ) )
-      => Dict ( Lookup k m ~ Just v )
-pass3 = Dict
+-- @ Lookup k ( Delete k m ) = Nothing @.
+pass3 :: ( s ~ Delete k m )
+      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      -> Dict ( Lookup k s ~ Nothing )
+pass3 _ _ _ _ = Dict
 
-pass4 :: ( m ~ Delete k s )
-      => Dict ( Lookup k m ~ Nothing )
-pass4 = Dict
+-- @ Insert k v ( Delete k m ) = m @ when @ Lookup k m = Just v @.
+pass4 :: ( s ~ Delete k m, Lookup k m ~ Just v )
+      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      -> Dict ( m ~ Insert k v s )
+pass4 _ _ _ _ = Dict
+
+-- @ Delete k ( Insert k v m ) = m @ when @ Lookup k m = Nothing @.
+pass5 :: ( s ~ Insert k v m, Lookup k s ~ Nothing )
+      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      -> Dict ( m ~ Delete k s )
+pass5 _ _ _ _ = Dict
+
+-- @ Delete k m = m @ when @ Lookup k m = Nothing @.
+pass6 :: ( Lookup k m ~ Nothing )
+      => Proxy k -> Proxy v -> Proxy m
+      -> Dict ( m ~ Delete k m )
+pass6 _ _ _ = Dict
 
 --------------------------------------------------------------------------------
 -- Should not type-check.
 
 -- @ Could not deduce Lookup k s ~ Nothing @
 fail1 :: ( m ~ Insert k v s )
-      => ()
-fail1 = ()
+      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      -> ()
+fail1 _ _ _ _ = ()
 
 -- @ Could not deduce Lookup k m ~ Just v @
 fail2 :: ( m ~ Delete l ( Insert k v s ), Lookup k s ~ 'Nothing )
-      => Dict ( Lookup k m ~ Just v )
-fail2 = Dict
+      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      -> Dict ( Lookup k m ~ Just v )
+fail2 _ _ _ _ = Dict
 
 -- @ Could not deduce Lookup k ( Insert k w s ) ~ Nothing @
 fail3 :: ( m ~ Insert k v ( Insert k w s ), Lookup k s ~ 'Nothing )
-      => ()
-fail3 = ()
+      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      -> ()
+fail3 _ _ _ _ = ()
