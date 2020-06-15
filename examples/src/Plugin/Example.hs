@@ -73,12 +73,18 @@ fail1 _ _ _ _ = ()
 
 -- @ Could not deduce Lookup k m ~ Just v @
 fail2 :: ( m ~ Delete l ( Insert k v s ), Lookup k s ~ 'Nothing )
-      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      => Proxy k -> Proxy l -> Proxy v -> Proxy s -> Proxy m
       -> Dict ( Lookup k m ~ Just v )
-fail2 _ _ _ _ = Dict
+fail2 _ _ _ _ _ = Dict
 
 -- @ Could not deduce Lookup k ( Insert k w s ) ~ Nothing @
 fail3 :: ( m ~ Insert k v ( Insert k w s ), Lookup k s ~ 'Nothing )
-      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      => Proxy k -> Proxy v -> Proxy w -> Proxy s -> Proxy m
       -> ()
-fail3 _ _ _ _ = ()
+fail3 _ _ _ _ _ = ()
+
+-- @ Occurs check @
+fail4 :: ( m1 ~ Insert k1 v1 m2, m2 ~ Insert k2 v2 m1, ( k1 == k2 ) ~ False )
+      => Proxy k1 -> Proxy k2 -> Proxy v1 -> Proxy v2 -> Proxy m1 -> Proxy m2
+      -> ()
+fail4 _ _ _ _ _ _ = ()
