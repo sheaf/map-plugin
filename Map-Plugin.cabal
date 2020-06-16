@@ -43,7 +43,9 @@ library
 
   build-depends:
     ghc
-      ^>= 8.11.0
+      ^>= 8.11.0,
+    containers
+      ^>= 0.6.2.1
 
 library Map-Plugin-Example
   

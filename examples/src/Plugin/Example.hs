@@ -34,9 +34,9 @@ pass1 _ _ _ _ = Dict
 
 -- @ Lookup k ( Delete l m ) = Lookup k m @ if @ l /= k@.
 pass2 :: ( s ~ Delete l m, ( k == l ) ~ 'False )
-      => Proxy k -> Proxy v -> Proxy s -> Proxy m
+      => Proxy k -> Proxy l -> Proxy v -> Proxy s -> Proxy m
       -> Dict ( Lookup k s ~ Lookup k m )
-pass2 _ _ _ _ = Dict
+pass2 _ _ _ _ _ = Dict
 
 -- @ Lookup k ( Delete k m ) = Nothing @.
 pass3 :: ( s ~ Delete k m )

@@ -3,18 +3,30 @@
 {-# LANGUAGE NamedFieldPuns  #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TupleSections   #-}
 
 module MapPlugin ( plugin ) where
 
 -- base
 import Control.Arrow
-  ( (***) )
+    ( (***) )
 import Control.Monad
-  ( join )
+    ( join )
 import Data.Either
-  ( partitionEithers )
+    ( partitionEithers )
+import Data.Foldable
+    ( toList )
 import Data.Maybe
-  ( catMaybes )
+    ( catMaybes, mapMaybe, maybeToList )
+import Data.Traversable
+    ( for )
+
+-- containers
+import Data.Map.Strict
+    ( Map )
+import qualified Data.Map.Strict
+  as Map
+    ( fromList, mapMaybeWithKey )
 
 -- ghc
 import qualified GHC
@@ -87,11 +99,15 @@ import qualified GHC.Tc.Types.Evidence
 import qualified GHC.Types.Name.Occurrence
   as GHC
     ( mkDataOcc, mkTcOcc )
+import qualified GHC.Types.Var
+  as GHC
+    ( TcTyVar )
 import qualified GHC.Utils.Outputable
   as GHC
     ( ppr, pprTrace ) --, pprPanic )
 
 --------------------------------------------------------------------------------
+-- Plugin definition and setup/finalisation.
 
 plugin :: GHC.Plugin
 plugin =
@@ -122,6 +138,14 @@ data PluginDefs =
     , differenceTyCon :: !GHC.TyCon
     }
 
+findModule :: String -> String -> GHC.TcPluginM GHC.Module
+findModule pkg modName = do
+  findResult <- GHC.findImportedModule ( GHC.mkModuleName modName ) ( Just $ GHC.fsLit pkg )
+  case findResult of
+    GHC.Found _ res     -> pure res
+    GHC.FoundMultiple _ -> error $ "MapPlugin: found multiple modules named " <> modName <> "."
+    _                   -> error $ "MapPlugin: could not find any module named " <> modName <> "."
+
 tcPluginInit :: GHC.TcPluginM PluginDefs
 tcPluginInit = do
   dataTypeMapModule <- findModule "Map-Plugin" "Data.Type.Map"
@@ -136,96 +160,118 @@ tcPluginInit = do
   differenceTyCon <- GHC.tcLookupTyCon   =<< GHC.lookupOrig dataTypeMapModule ( GHC.mkTcOcc   "Difference" )
   pure ( PluginDefs { .. } )
 
-findModule :: String -> String -> GHC.TcPluginM GHC.Module
-findModule pkg modName = do
-  findResult <- GHC.findImportedModule ( GHC.mkModuleName modName ) ( Just $ GHC.fsLit pkg )
-  case findResult of
-    GHC.Found _ res     -> pure res
-    GHC.FoundMultiple _ -> error $ "MapPlugin: found multiple modules named " <> modName <> "."
-    _                   -> error $ "MapPlugin: could not find any module named " <> modName <> "."
-
 tcPluginStop :: PluginDefs -> GHC.TcPluginM ()
 tcPluginStop _ = pure ()
 
-tcPluginSolve :: PluginDefs -> [ GHC.Ct ] -> [ GHC.Ct ] -> [ GHC.Ct ] -> GHC.TcPluginM GHC.TcPluginResult
-tcPluginSolve _state _givens _deriveds []      = pure $ GHC.TcPluginOk [] []
-tcPluginSolve  state  givens  deriveds wanteds = do
-  ( contras, oks )
-    <- GHC.pprTrace "Givens:"   ( GHC.ppr givens   )
-    .  GHC.pprTrace "Deriveds:" ( GHC.ppr deriveds )
-    .  GHC.pprTrace "Wanteds:"  ( GHC.ppr wanteds  )
-    .  partitionEithers
-    <$> traverse ( \ wanted -> specifyWanted wanted <$> solveWanted state givens deriveds wanted ) wanteds
-  case contras of
-    [] ->
-      let
-        solveds :: [ ( GHC.EvTerm, GHC.Ct ) ]
-        news    :: [ GHC.Ct ]
-        ( solveds, news ) = ( catMaybes *** join ) ( unzip oks )
-      in  pure $ GHC.TcPluginOk solveds news
-    _  -> pure $ GHC.TcPluginContradiction contras
+--------------------------------------------------------------------------------
+-- Looking through types and given constraints,
+-- in order to find type family applications we're interested in.
 
-data SolverResult
-  = Unsolved
-    { newCts   :: ![ GHC.Ct ] }
-  | Solved
-    { evidence :: !GHC.EvTerm
-    , newCts   :: ![ GHC.Ct ]
-    }
-  | Contradiction
+data MapTyConApp
+  = Lookup !GHC.Type !GHC.Type !GHC.Type !GHC.Type
+  | Insert !GHC.Type !GHC.Type !GHC.Type !GHC.Type !GHC.Type
+  | Delete !GHC.Type !GHC.Type !GHC.Type !GHC.Type
+  -- others: todo
 
-pattern Ignore :: SolverResult
-pattern Ignore = Unsolved []
+type FSk = GHC.TcTyVar
 
-specifyWanted :: GHC.Ct -> SolverResult -> Either GHC.Ct ( Maybe ( GHC.EvTerm, GHC.Ct ), [ GHC.Ct ] )
-specifyWanted _      ( Unsolved {..} ) = Right ( Nothing, newCts )
-specifyWanted wanted ( Solved   {..} ) = Right ( Just ( evidence, wanted ), newCts )
-specifyWanted wanted Contradiction     = Left wanted
+-- | Recognise fully saturated applications of supported types,
+-- such as @ Insert {kind_k} {kind_v} k v m @.
+recogniseExplicitMapTyConApp :: PluginDefs -> GHC.TyCon -> [ GHC.Type ] -> Maybe MapTyConApp
+recogniseExplicitMapTyConApp ( PluginDefs { .. } ) tyCon args
+  | tyCon == lookupTyCon
+  , [ kind_k, kind_v, k, m ] <- args
+  = Just $ Lookup kind_k kind_v k m
+  | tyCon == insertTyCon
+  , [ kind_k, kind_v, k, v, m ] <- args
+  = Just $ Insert kind_k kind_v k v m
+  | tyCon == deleteTyCon
+  , [ kind_k, kind_v, k, m ] <- args
+  = Just $ Delete kind_k kind_v k m
+  | otherwise
+  = Nothing
 
-solveWanted :: PluginDefs -> [ GHC.Ct ] -> [ GHC.Ct ] -> GHC.Ct -> GHC.TcPluginM SolverResult
-solveWanted pluginDefs givens _deriveds wanted =
-  case GHC.classifyPredType ( GHC.ctPred wanted ) of
-    GHC.EqPred GHC.NomEq lhs rhs -> do
-      newCts <- catMaybes <$> traverse ( simplify pluginDefs givens wanted ) [ lhs, rhs ]
-      pure $ Unsolved {..}
-    _ -> pure Ignore
+-- | Recognise supported types, either directly or through flattening skolem type variables.
+recogniseMapTyConApp :: PluginDefs -> Map FSk MapTyConApp -> GHC.Type -> [ MapTyConApp ]
+recogniseMapTyConApp pluginDefs fsks ty = case ty of
+  GHC.TyConApp tyCon args -> maybeToList $ recogniseExplicitMapTyConApp pluginDefs tyCon args
+  _ -> toList $ ( `Map.mapMaybeWithKey` fsks ) \ fsk tyConApp ->
+        case GHC.tcMatchTy ty ( GHC.TyVarTy fsk ) of
+          Nothing -> Nothing
+          Just _  -> Just tyConApp
+
+-- | Recognise supported type family applications in the provided list of given constraints.
+relevantGivenFunEqs :: PluginDefs -> [ GHC.Ct ] -> Map FSk MapTyConApp
+relevantGivenFunEqs pluginDefs = Map.fromList . mapMaybe \case
+  GHC.CFunEqCan { cc_fun, cc_tyargs, cc_fsk }
+    -> ( cc_fsk, ) <$> recogniseExplicitMapTyConApp pluginDefs cc_fun cc_tyargs
+  _ -> Nothing
+
+--------------------------------------------------------------------------------
+-- Simplification of type family applications.
 
 -- | Try to simplify a type, e.g. simplify @ Lookup k ( Insert k v s ) @ to @ v @.
-simplify :: PluginDefs -> [ GHC.Ct ] -> GHC.Ct -> GHC.Type -> GHC.TcPluginM ( Maybe GHC.Ct )
-simplify pluginDefs@( PluginDefs { .. } ) givens wanted ty =
-  case ty of
-    -- Recognise one of the handled `TyCon`s (`Lookup`, `Insert`, ...)
-    GHC.TyConApp tyCon args
-      -- Fully saturated application of `Lookup` type family
-      | tyCon == lookupTyCon
-      , [ kind_k, kind_v, k, kvs ] <- args
+simplify :: PluginDefs -> [ GHC.Ct ] -> Map FSk MapTyConApp -> GHC.Ct -> GHC.Type -> GHC.TcPluginM [ GHC.Ct ]
+simplify pluginDefs _givens fsks wanted ty = do
+  concat <$> for ( recogniseMapTyConApp pluginDefs fsks ty ) \case
+    Lookup kind_k kind_v k kvs
       -> do
-        simpl <- simplifyLookup pluginDefs givens k kvs
-        case simpl of
-          NoSimplification ->
-            pure Nothing
-          SimplifyArg arg  -> do
-            let
-              simplTy :: GHC.Type
-              simplTy = GHC.mkTyConApp lookupTyCon [ kind_k, kind_v, k, arg ]
-            Just <$> newDeducedGivenEq wanted ty simplTy
-          Result ( Just res ) -> do
-            let
-              resTy :: GHC.Type
-              resTy = GHC.mkTyConApp GHC.promotedJustDataCon [ kind_v, res ]
-            Just <$> newDeducedGivenEq wanted ty resTy
-          Result Nothing -> do
-            let
-              resTy :: GHC.Type
-              resTy = GHC.mkTyConApp GHC.promotedNothingDataCon [ kind_v ]
-            Just <$> newDeducedGivenEq wanted ty resTy
+        simpls <- simplifyLookup pluginDefs fsks k kvs
+        traverse 
+          ( newDeducedGivenEq wanted ty )
+          ( lookupSimplificationTy pluginDefs kind_k kind_v k <$> simpls )
+    _ -> pure []
+
+-- | Outcome of attempting to simplify a type family application `F ... a`.
+data TyFamAppSimplification arg res
+  = SimplifyArg arg   -- ^ Simplification of the last type family argument.
+  | Result      res   -- ^ Computation of the full type family application.
+
+-- | Tries to simplify a type family application @ Lookup k kvs @.
+simplifyLookup :: PluginDefs -> Map FSk MapTyConApp -> GHC.Type -> GHC.Type
+               -> GHC.TcPluginM [ TyFamAppSimplification GHC.Type ( Maybe GHC.Type ) ]
+simplifyLookup pluginDefs fsks k0 kvs0 =
+  catMaybes <$> for ( recogniseMapTyConApp pluginDefs fsks kvs0 ) \case
+    Insert _kind_k _kind_v k1 v1 kvs1 -> do
+      mbEq <- eqTy pluginDefs k0 k1
+      case mbEq of
+        -- @ Lookup k0 ( Insert k1 v1 kvs1 ) ~ Just v1 @ when @ k0 ~ k1 @.
+        Just True  -> pure $ Just ( Result $ Just v1 )
+        -- @ Lookup k0 ( Insert k1 v1 kvs1 ) ~ Lookup k0 kvs1 @ when @ k0 /~ k1 @.
+        Just False -> pure $ Just ( SimplifyArg kvs1 )
+        Nothing    -> pure Nothing
+    Delete _kind_k _kind_v k1 kvs1 -> do
+      mbEq <- eqTy pluginDefs k0 k1
+      case mbEq of
+        -- @ Lookup k0 ( Delete k1 kvs1 ) ~ Nothing @ when @ k0 ~ k1 @.
+        Just True  -> pure $ Just ( Result Nothing )
+        -- @ Lookup k0 ( Delete k1 kvs1 ) ~ Lookup k0 kvs1 @ when @ k0 /~ k1 @.
+        Just False -> pure $ Just ( SimplifyArg kvs1 )
+        -- If we don't know whether @ k0 @ and @ k1 @ can unify,
+        -- it is still worth trying to simplify @ kvs1 @, as @ Lookup k0 kvs1 ~ Nothing @
+        -- would also imply that @ Lookup k0 ( Delete k1 kvs1 ) ~ Nothing @.
+        Nothing    -> do
+          simplFurther <- simplifyLookup pluginDefs fsks k0 kvs1
+          if any ( \case { Result Nothing -> True; _ -> False } ) simplFurther
+          then pure $ Just ( Result Nothing )
+          else pure Nothing
     _ -> pure Nothing
 
-data TyFamAppSimplification arg res
-  = NoSimplification
-  | SimplifyArg arg
-  | Result      res
+-- | Returns the type corresponding to the outcome of simplifying
+-- an expression of the form @ Lookup k m @.
+lookupSimplificationTy :: PluginDefs -> GHC.Type -> GHC.Type -> GHC.Type
+                       -> TyFamAppSimplification GHC.Type ( Maybe GHC.Type )
+                       -> GHC.Type
+lookupSimplificationTy ( PluginDefs { lookupTyCon } ) kind_k kind_v k simpl = case simpl of
+  SimplifyArg arg     -> GHC.mkTyConApp lookupTyCon [ kind_k, kind_v, k, arg ]
+  Result ( Just res ) -> GHC.mkTyConApp GHC.promotedJustDataCon [ kind_v, res ]
+  Result Nothing      -> GHC.mkTyConApp GHC.promotedNothingDataCon [ kind_v ]
 
+--------------------------------------------------------------------------------
+-- Handling equalities.
+
+-- | Returns a new given equality constraint @ lhs ~ rhs @,
+-- obtained by bumping the depth of the provided constraint.
 newDeducedGivenEq :: GHC.Ct -> GHC.Type -> GHC.Type -> GHC.TcPluginM GHC.Ct
 newDeducedGivenEq ct lhs rhs = do
   let
@@ -238,55 +284,77 @@ newDeducedGivenEq ct lhs rhs = do
       ( GHC.Coercion coercion )
   pure ( GHC.mkNonCanonical evidence )
 
--- | Tries to simplify a type family application @ Lookup k kvs @ (either computing the result or simplifying @ kvs @).
-simplifyLookup :: PluginDefs -> [ GHC.Ct ] -> GHC.Type -> GHC.Type -> GHC.TcPluginM ( TyFamAppSimplification GHC.Type ( Maybe GHC.Type ) )
-simplifyLookup pluginDefs@( PluginDefs { .. } ) givens k0 kvs0 =
-  case kvs0 of
-    GHC.TyConApp tyCon args
-      | tyCon == insertTyCon
-      , [ _kind_k, _kind_v, k1, v1, kvs1 ] <- args
-      -> do
-        mbEq <- eqTy pluginDefs givens k0 k1
-        case mbEq of
-          -- @ Lookup k0 ( Insert k1 v1 kvs1 ) ~ Just v1 @ when @ k0 ~ k1 @.
-          Just True  -> pure ( Result $ Just v1 )
-          -- @ Lookup k0 ( Insert k1 v1 kvs1 ) ~ Lookup k0 kvs1 @ when @ k0 /~ k1 @.
-          Just False -> pure ( SimplifyArg kvs1 )
-          Nothing    -> pure NoSimplification
-      | tyCon == deleteTyCon
-      , [ _kind_k, _kind_v, k1, kvs1 ] <- args
-      -> do
-        mbEq <- eqTy pluginDefs givens k0 k1
-        case mbEq of
-          -- @ Lookup k0 ( Delete k1 kvs1 ) ~ Nothing @ when @ k0 ~ k1 @.
-          Just True  -> pure ( Result Nothing )
-          -- @ Lookup k0 ( Delete k1 kvs1 ) ~ Lookup k0 kvs1 @ when @ k0 /~ k1 @.
-          Just False -> pure ( SimplifyArg kvs1 )
-          -- If we don't know whether @ k0 @ and @ k1 @ can unify,
-          -- it is still worth trying to simplify @ kvs1 @, as @ Lookup k0 kvs1 ~ Nothing @
-          -- would also imply that @ Lookup k0 ( Delete k1 kvs1 ) ~ Nothing @.
-          Nothing    -> do
-            simplFurther <- simplifyLookup pluginDefs givens k0 kvs1
-            case simplFurther of
-              Result Nothing -> pure ( Result Nothing )
-              _              -> pure NoSimplification
-      {-
-      | tyCon == GHC.promoteDataCon fromListDataCon
-      , [ _kind_k, _kind_v, list ] <- args
-      -> listLookup pluginDefs givens k0 list
-      -}
-    _ -> pure NoSimplification
-
 -- | Computes whether `lhs == rhs`.
 --
 --  - @ Just True @: types are equal,
 --  - @ Just False @: types are apart,
 --  - @ Nothing @: unknown at this stage.
-eqTy :: PluginDefs -> [ GHC.Ct ] -> GHC.Type -> GHC.Type -> GHC.TcPluginM ( Maybe Bool )
-eqTy ( PluginDefs {} ) _givens lhs rhs
+eqTy :: PluginDefs -> GHC.Type -> GHC.Type -> GHC.TcPluginM ( Maybe Bool )
+eqTy ( PluginDefs {} ) lhs rhs
   | Just _ <- GHC.tcMatchTy lhs rhs
   = pure $ Just True
   | GHC.typesCantMatch [ ( lhs, rhs ) ]
   = pure $ Just False
   | otherwise
   = pure $ Nothing
+
+--------------------------------------------------------------------------------
+-- Solver part of the plugin.
+
+tcPluginSolve :: PluginDefs -> [ GHC.Ct ] -> [ GHC.Ct ] -> [ GHC.Ct ] -> GHC.TcPluginM GHC.TcPluginResult
+tcPluginSolve _defs _givens _deriveds []      = pure $ GHC.TcPluginOk [] []
+tcPluginSolve  defs  givens  deriveds wanteds = do
+  let
+    fsks :: Map FSk MapTyConApp 
+    fsks = GHC.pprTrace "Givens:"   ( GHC.ppr givens   )
+         . GHC.pprTrace "Deriveds:" ( GHC.ppr deriveds )
+         . GHC.pprTrace "Wanteds:"  ( GHC.ppr wanteds  )
+         $ relevantGivenFunEqs defs givens
+  ( contras, oks )
+    <- partitionEithers
+    <$> traverse ( \ wanted -> specifyWanted wanted <$> solveWanted defs givens fsks deriveds wanted ) wanteds
+  case contras of
+    [] ->
+      let
+        solveds :: [ ( GHC.EvTerm, GHC.Ct ) ]
+        news    :: [ GHC.Ct ]
+        ( solveds, news ) = ( catMaybes *** join ) ( unzip oks )
+      in  pure $ GHC.TcPluginOk
+                  ( GHC.pprTrace "Solveds:" ( GHC.ppr solveds ) $ solveds )
+                  ( GHC.pprTrace "News:"    ( GHC.ppr news    ) $ news    )
+    _  -> pure $ GHC.TcPluginContradiction contras
+
+-- | Outcome of running the Map plugin on a single wanted constraint.
+data SolverResult
+  = Unsolved -- ^ Wanted constraint was not solved, but new constraints might be emitted.
+    { newCts   :: ![ GHC.Ct ] }
+  | Solved   -- ^ Wanted constraint has been solved: evidence, and new constraints to emit.
+    { evidence :: !GHC.EvTerm
+    , newCts   :: ![ GHC.Ct ]
+    }
+  | Contradiction -- ^ The plugin has uncovered a contradiction.
+
+pattern Ignore :: SolverResult
+pattern Ignore = Unsolved []
+
+-- | Try to solve a wanted constraint.
+--
+-- This function currently never directly solves the constraint,
+-- but might make progress (emitting new given constraints),
+-- which hopefully will allow GHC to solve it.
+solveWanted :: PluginDefs -> [ GHC.Ct ] -> Map FSk MapTyConApp  -> [ GHC.Ct ] -> GHC.Ct -> GHC.TcPluginM SolverResult
+solveWanted pluginDefs givens fsks _deriveds wanted =
+  case GHC.classifyPredType ( GHC.ctPred wanted ) of
+    GHC.EqPred GHC.NomEq lhs rhs -> do
+      newCts <- GHC.pprTrace "lhs =" ( GHC.ppr $ lhs )
+              . GHC.pprTrace "rhs =" ( GHC.ppr $ rhs )
+              $
+              concat <$> traverse ( simplify pluginDefs givens fsks wanted ) [ lhs, rhs ]
+      pure $ Unsolved {..}
+    _ -> pure Ignore
+
+-- | Passthrough of the wanted constraint, to report a solution/contradiction.
+specifyWanted :: GHC.Ct -> SolverResult -> Either GHC.Ct ( Maybe ( GHC.EvTerm, GHC.Ct ), [ GHC.Ct ] )
+specifyWanted _      ( Unsolved {..} ) = Right ( Nothing, newCts )
+specifyWanted wanted ( Solved   {..} ) = Right ( Just ( evidence, wanted ), newCts )
+specifyWanted wanted Contradiction     = Left wanted
