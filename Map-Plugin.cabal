@@ -45,7 +45,9 @@ library
     ghc
       ^>= 8.11.0,
     containers
-      ^>= 0.6.2.1
+      ^>= 0.6.2.1,
+    data-partition
+      ^>= 0.3.0.0
 
 library Map-Plugin-Example
   

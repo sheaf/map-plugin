@@ -14,9 +14,9 @@ module MapPlugin ( plugin ) where
 
 -- base
 import Control.Arrow
-    ( (***) )
+    ( (***), first )
 import Control.Monad
-    ( join )
+    ( guard, join )
 import Data.Coerce
     ( coerce )
 import Data.Either
@@ -26,27 +26,20 @@ import Data.Foldable
 import Data.Maybe
     ( catMaybes, mapMaybe )
 import Data.Monoid
-    ( Ap(..) )
-import Data.Semigroup
-    ( First(..) )
-import GHC.Exts
-    ( Int(..), dataToTag# )
+    ( Any(..), Ap(..) )
 
 -- containers
-import Data.Map.Strict
-    ( Map )
-import qualified Data.Map.Strict
-  as Map
-    ( foldMapWithKey, fromListWith, lookup
-    , mapMaybeWithKey, unionWith
-    )
 import Data.Set
     ( Set )
 import qualified Data.Set
   as Set
     ( empty, fromList, insert
-    , isSubsetOf, map, singleton, union
+    , map, singleton
     )
+
+-- data-partition
+import Data.Partition as Partition
+  ( fromSets, nontrivialSets )
 
 -- ghc
 import qualified GHC
@@ -67,11 +60,9 @@ import qualified GHC.Core
 import qualified GHC.Core.Coercion
   as GHC
     ( Coercion, mkUnivCo, mkPrimEqPredRole )
-{-
 import qualified GHC.Core.DataCon
   as GHC
-    ( promoteDataCon )
--}
+    ( DataCon )
 import qualified GHC.Core.Predicate
   as GHC
     ( Pred(..), classifyPredType
@@ -79,9 +70,12 @@ import qualified GHC.Core.Predicate
     )
 import qualified GHC.Core.TyCo.Rep
   as GHC
-    ( Type(..)
+    ( Type(..), Kind
     , UnivCoProvenance(..)
     )
+import qualified GHC.Core.TyCon
+  as GHC
+    ( TyCon(..) )
 import qualified GHC.Core.Type
   as GHC
     ( eqType, mkTyConApp, nonDetCmpType )
@@ -97,12 +91,6 @@ import qualified GHC.Data.FastString
 import qualified GHC.Plugins
   as GHC
     ( Plugin(..), defaultPlugin, purePlugin )
-import qualified GHC.Core.DataCon
-  as GHC
-    ( DataCon )
-import qualified GHC.Core.TyCon
-  as GHC
-    ( TyCon(..) )
 import qualified GHC.Tc.Plugin
   as GHC
     ( findImportedModule
@@ -128,7 +116,7 @@ import qualified GHC.Types.Name.Occurrence
     ( mkDataOcc, mkTcOcc )
 import qualified GHC.Types.Var
   as GHC
-    ( TcTyVar, varUnique )
+    ( TcTyVar )
 import qualified GHC.Utils.Outputable
   as GHC
     ( Outputable(..), pprTrace, text ) --, pprPanic )
@@ -199,32 +187,23 @@ tcPluginStop _ = pure ()
 -- Looking through types and given constraints,
 -- in order to find types we're interested in.
 
--- Horrible instances so that we can conveniently use sets and maps.
-instance Eq  GHC.Ct where
-  ct1 == ct2 = compare ct1 ct2 == EQ
-instance Ord GHC.Ct where
-  compare ct1 ct2 =
-    case compare ( I# ( dataToTag# ct1 ) ) ( I# ( dataToTag# ct2 ) ) of
-      EQ   -> compare ( GHC.ctPred ct1 ) ( GHC.ctPred ct2 )
-      uneq -> uneq
+-- Unfortunate instances so that we can conveniently use sets and maps.
 instance Eq  GHC.Type where
   ty1 == ty2 = compare ty1 ty2 == EQ
 instance Ord GHC.Type where
   compare = GHC.nonDetCmpType
 
 data TyConApp
-  = TyEqRHS !GHC.Type -- RHS of a CTyEqCan.
-  | Eq      !GHC.Type !GHC.Type !GHC.Type -- ^ 'Data.Type.Equality.=='
+  = Eq      !GHC.Kind !GHC.Type !GHC.Type -- ^ 'Data.Type.Equality.=='
   | Boolean !Bool
-  | Maybe   !GHC.Type !( Maybe GHC.Type )
-  | Lookup  !GHC.Type !GHC.Type !GHC.Type !GHC.Type
-  | Insert  !GHC.Type !GHC.Type !GHC.Type !GHC.Type !GHC.Type
-  | Delete  !GHC.Type !GHC.Type !GHC.Type !GHC.Type
+  | Maybe   !GHC.Kind !( Maybe GHC.Type )
+  | Lookup  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type
+  | Insert  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type !GHC.Type
+  | Delete  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type
   -- others: todo
   deriving stock ( Eq, Ord )
 
 instance GHC.Outputable TyConApp where
-  ppr ( TyEqRHS t           ) = GHC.text "TyEqRhs"        <+> GHC.ppr t
   ppr ( Eq      k a b       ) = GHC.text "Eq "            <+> GHC.ppr [ k, a, b ]
   ppr ( Boolean b           ) = GHC.text "Boolean"        <+> GHC.ppr b
   ppr ( Maybe   k ( Just v )) = GHC.text "Maybe: Just"    <+> GHC.ppr [ k, v ]
@@ -263,12 +242,12 @@ recogniseExplicitTyConApp ( PluginDefs { .. } ) tyCon args
   = Nothing
 
 -- | Recognise supported type family applications and equalities in the provided list of given constraints.
-recogniseGivenTyConApps :: PluginDefs -> [ GHC.Ct ] -> Map GHC.TcTyVar ( Set TyConApp )
-recogniseGivenTyConApps pluginDefs = Map.fromListWith Set.union . mapMaybe \case
+recogniseGivenTyConApps :: PluginDefs -> [ GHC.Ct ] -> ( [ ( GHC.Type, GHC.Type ) ], [ ( GHC.TcTyVar, TyConApp ) ] )
+recogniseGivenTyConApps pluginDefs = partitionEithers . mapMaybe \case
   GHC.CFunEqCan { cc_fun, cc_tyargs, cc_fsk }
-    -> ( cc_fsk, ) . Set.singleton <$> recogniseExplicitTyConApp pluginDefs cc_fun cc_tyargs
+    -> Right . ( cc_fsk, ) <$> recogniseExplicitTyConApp pluginDefs cc_fun cc_tyargs
   GHC.CTyEqCan { cc_tyvar, cc_rhs }
-    -> Just ( cc_tyvar, Set.singleton ( TyEqRHS cc_rhs ) )
+    -> Just $ Left ( GHC.TyVarTy cc_tyvar, cc_rhs )
   _ -> Nothing
 
 -- | Recognise supported types:
@@ -277,73 +256,72 @@ recogniseGivenTyConApps pluginDefs = Map.fromListWith Set.union . mapMaybe \case
 --  - type is a flattening type variable associated to a recognised @ CFunEqCan @,
 --  - type is transitively equal to a supported type,
 --    through an explicit @ CTyEqCan @: @ ty ~# recognisedTyConApp @.
-recogniseTyConApps :: PluginDefs -> [ GHC.Ct ] -> Map GHC.TcTyVar ( Set TyConApp )
-recogniseTyConApps pluginDefs givens = transitiveClosure 0 basicApps
-  where
-    basicApps :: Map GHC.TcTyVar ( Set TyConApp )
-    basicApps = recogniseGivenTyConApps pluginDefs givens
-    transitiveClosure :: Int -> Map GHC.TcTyVar ( Set TyConApp ) -> Map GHC.TcTyVar ( Set TyConApp )
-    transitiveClosure iter apps
-      | iter > 100
-      = apps
-      | otherwise
-      = let
-          newTransitiveApps :: Map GHC.TcTyVar ( Set TyConApp )
-          newTransitiveApps = ( `Map.mapMaybeWithKey` apps ) \ tv tv_apps ->
-            ( `foldMap` tv_apps ) \case
-              -- Found a @ CTyEqCan @ : @ ty ~# rhs @.
-              -- Go through the map of TyConApps to see if @ rhs @ has any,
-              -- to transitively add them to @ ty @.
-              TyEqRHS rhs ->
-                let
-                  newApps :: Set TyConApp
-                  newApps = ( `Map.foldMapWithKey` apps ) \ tv' tyConApps ->
-                    if   ( GHC.TyVarTy tv' ) `GHC.eqType` rhs
-                    then tyConApps
-                    else Set.empty
-                in
-                  case Map.lookup tv apps of
-                    -- No TyConApps for @ tv @ (neither before nor after).
-                    Nothing
-                      | null newApps
-                      -> Nothing
-                    -- No new TyConApps for @ tv @.
-                    Just prevApps
-                      | newApps `Set.isSubsetOf` prevApps
-                      -> Nothing
-                    -- New TyConApps for @ tv @.
-                    _ -> Just newApps
-              _ -> Nothing
-        in
-          if null newTransitiveApps
-          then apps
-          else transitiveClosure ( iter + 1 ) ( Map.unionWith Set.union apps newTransitiveApps )
+recogniseTyConApps :: PluginDefs -> [ GHC.Ct ] -> [ ( Set GHC.Type, Set TyConApp ) ]
+recogniseTyConApps pluginDefs givens =
+  ( `mapMaybe` comps ) \ comp_tys ->
+    let
+      comp_apps :: Set TyConApp
+      comp_apps = foldMap tyConApps comp_tys
+    in
+      if   null comp_apps
+      then Nothing
+      else Just ( comp_tys, comp_apps )
 
-recognise :: PluginDefs -> Map GHC.TcTyVar ( Set TyConApp ) -> GHC.Type -> Set TyConApp
-recognise pluginDefs tyConApps ty = case ty of
-  GHC.TyConApp tyCon args
-    | Just app <- recogniseExplicitTyConApp pluginDefs tyCon args
-    -> Set.singleton app
-  GHC.TyVarTy tv
-    -> Map.foldMapWithKey ( lookupTv tv ) tyConApps
-  _ -> Set.empty
   where
-    lookupTv :: GHC.TcTyVar -> GHC.TcTyVar -> Set TyConApp -> Set TyConApp
-    lookupTv tv tv' apps
-      | GHC.varUnique tv == GHC.varUnique tv'
+    comps     :: [ Set GHC.Type ]
+    basicApps :: [ ( GHC.TcTyVar, TyConApp ) ]
+    ( comps, basicApps ) = first sccs $ recogniseGivenTyConApps pluginDefs givens
+
+    tyConApps :: GHC.Type -> Set TyConApp
+    tyConApps ty =
+      let
+        apps :: Set TyConApp
+        apps
+          | Just explicitApp <- mbExplicitApp
+          = Set.insert explicitApp lookedUpApps
+          | otherwise
+          = lookedUpApps
+        mbExplicitApp :: Maybe TyConApp
+        mbExplicitApp = case ty of
+          GHC.TyConApp tyCon args
+            -> recogniseExplicitTyConApp pluginDefs tyCon args
+          _ -> Nothing
+        lookedUpApps :: Set TyConApp
+        lookedUpApps = Set.fromList $ ( `mapMaybe` basicApps ) \ ( tv, app ) -> do
+          guard ( GHC.eqType ty ( GHC.TyVarTy tv ) )
+          pure app
+      in
+        apps
+
+
+sccs :: Ord a => [ ( a, a ) ] -> [ Set a ]
+sccs = Partition.nontrivialSets
+     . Partition.fromSets
+     . map ( \ ( x, y ) -> Set.fromList [x,y] )
+
+recognise :: PluginDefs -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> Set TyConApp
+recognise pluginDefs tyConApps ty
+  | GHC.TyConApp tyCon args <- ty
+  , Just app <- recogniseExplicitTyConApp pluginDefs tyCon args
+  = Set.insert app ( go tyConApps )
+  | otherwise
+  = go tyConApps
+  where
+    go :: [ ( Set GHC.Type, Set TyConApp ) ] -> Set TyConApp
+    go [] = Set.empty
+    go ( ( comp, apps ) : comps )
+      | any ( GHC.eqType ty ) comp
       = apps
-      | any ( \case { TyEqRHS ( GHC.TyVarTy tv'' ) | GHC.varUnique tv == GHC.varUnique tv'' -> True; _ -> False } ) apps
-      = Set.insert ( TyEqRHS ( GHC.TyVarTy tv' ) ) apps
       | otherwise
-      = Set.empty
+      = go comps
 
 --------------------------------------------------------------------------------
 -- Simplification of type family applications.
 
 -- | Try to simplify a type, e.g. simplify @ Lookup k ( Insert k v s ) @ to @ v @.
-simplify :: PluginDefs -> [ GHC.Ct ] -> Map GHC.TcTyVar ( Set TyConApp ) -> GHC.Ct -> GHC.Type -> GHC.TcPluginM [ GHC.Ct ]
+simplify :: PluginDefs -> [ GHC.Ct ] -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Ct -> GHC.Type -> GHC.TcPluginM [ GHC.Ct ]
 simplify pluginDefs _givens tyConApps wanted ty =
-  coerce $ toList <$> ( `foldMap` ty_apps ) \case
+  coerce $ ( `foldMap` ty_apps ) \case
       Lookup kind_k kind_v k kvs -> Ap $ do
         let
           simpls :: Set GHC.Type
@@ -351,12 +329,10 @@ simplify pluginDefs _givens tyConApps wanted ty =
             Set.map
               ( lookupSimplificationTy pluginDefs kind_k kind_v k )
               ( simplifyLookup pluginDefs tyConApps k kvs )
-        Set.fromList
-          <$>
-            traverse
-              ( newDeducedGivenEq wanted ty )
-              ( toList simpls )
-      _ -> pure Set.empty
+        traverse
+          ( newDeducedGivenEq wanted ty )
+          ( toList simpls )
+      _ -> pure []
   where
     ty_apps :: Set TyConApp
     ty_apps = recognise pluginDefs tyConApps ty
@@ -368,14 +344,14 @@ data TyFamAppSimplification arg res
   deriving stock ( Eq, Ord )
 
 -- | Tries to simplify a type family application @ Lookup k kvs @.
-simplifyLookup :: PluginDefs -> Map GHC.TcTyVar ( Set TyConApp ) -> GHC.Type -> GHC.Type
+simplifyLookup :: PluginDefs -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type
                -> Set ( TyFamAppSimplification GHC.Type ( Maybe GHC.Type ) )
 simplifyLookup pluginDefs tyConApps k0 kvs0 =
     ( `foldMap` ( recognise pluginDefs tyConApps kvs0 ) ) \case
       Insert _kind_k _kind_v k1 v1 kvs1 ->
         let
           mbEq :: Maybe Bool
-          mbEq = eqTy pluginDefs tyConApps k0 k1
+          mbEq = eqTy tyConApps k0 k1
         in
           case mbEq of
             -- @ Lookup k0 ( Insert k1 v1 kvs1 ) ~ Just v1 @ when @ k0 ~ k1 @.
@@ -386,7 +362,7 @@ simplifyLookup pluginDefs tyConApps k0 kvs0 =
       Delete _kind_k _kind_v k1 kvs1 ->
         let
           mbEq :: Maybe Bool
-          mbEq = eqTy pluginDefs tyConApps k0 k1
+          mbEq = eqTy tyConApps k0 k1
         in
           case mbEq of
             -- @ Lookup k0 ( Delete k1 kvs1 ) ~ Nothing @ when @ k0 ~ k1 @.
@@ -408,7 +384,7 @@ simplifyLookup pluginDefs tyConApps k0 kvs0 =
 
 -- | Returns the type corresponding to the outcome of simplifying
 -- an expression of the form @ Lookup k m @.
-lookupSimplificationTy :: PluginDefs -> GHC.Type -> GHC.Type -> GHC.Type
+lookupSimplificationTy :: PluginDefs -> GHC.Kind -> GHC.Kind -> GHC.Type
                        -> TyFamAppSimplification GHC.Type ( Maybe GHC.Type )
                        -> GHC.Type
 lookupSimplificationTy ( PluginDefs { lookupTyCon } ) kind_k kind_v k simpl = case simpl of
@@ -438,42 +414,62 @@ newDeducedGivenEq ct lhs rhs = do
 --  - @ Just True @: types are equal,
 --  - @ Just False @: types are apart,
 --  - @ Nothing @: unknown at this stage.
-eqTy :: PluginDefs -> Map GHC.TcTyVar ( Set TyConApp ) -> GHC.Type -> GHC.Type -> Maybe Bool
-eqTy pluginDefs tyConApps lhs rhs
+eqTy :: [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type -> Maybe Bool
+eqTy tyConApps lhs rhs
   | GHC.eqType lhs rhs
   = Just True
-  | Just True <- givenEq
+  | lookupGivenEq tyConApps lhs rhs
   = Just True
   | GHC.typesCantMatch [ ( lhs, rhs ) ]
   = Just False
-  | Just False <- givenEq
+  | lookupGivenUnEq tyConApps lhs rhs
   = Just False
   | otherwise
   = Nothing
-  where
-    givenEq :: Maybe Bool
-    givenEq = lookupGivenEq pluginDefs tyConApps lhs rhs
 
--- | Try to compute @ lhs == rhs @ using information deduced from given constraints.
-lookupGivenEq :: PluginDefs -> Map GHC.TcTyVar ( Set TyConApp ) -> GHC.Type -> GHC.Type -> Maybe Bool
-lookupGivenEq pluginDefs tyConApps lhs rhs = coerce $ Map.foldMapWithKey ( \ tv -> foldMap ( findGivenEq tv ) ) tyConApps
+-- | Compute whether given constraints imply that @ lhs ~ rhs @.
+lookupGivenEq :: [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type -> Bool
+lookupGivenEq tyConApps lhs rhs = any eqEvidence tyConApps
   where
-    -- | Look for type family applications "lhs == rhs"
-    findGivenEq :: GHC.TcTyVar -> TyConApp -> Maybe ( First Bool )
-    findGivenEq tv ( Eq _ a b )
-      | Just True <- eqTy pluginDefs tyConApps lhs a
-      , Just True <- eqTy pluginDefs tyConApps rhs b
-      = findValue tv
-      | Just True <- eqTy pluginDefs tyConApps rhs a
-      , Just True <- eqTy pluginDefs tyConApps lhs b
-      = findValue tv
-    findGivenEq _ _
-      = Nothing
-    findValue :: GHC.TcTyVar -> Maybe ( First Bool )
-    findValue tv = foldMap boolValue ( recognise pluginDefs tyConApps ( GHC.TyVarTy tv ) )
-    boolValue :: TyConApp -> Maybe ( First Bool )
-    boolValue ( Boolean b ) = Just ( First b )
-    boolValue _             = Nothing
+    -- Check whether @ lhs @ and @ rhs @ appear in the same component.
+    eqEvidence :: ( Set GHC.Type, Set TyConApp ) -> Bool
+    eqEvidence ( tys, _ ) = case foldMap elems tys of
+      ( Any True, Any True ) -> True
+      _                      -> False
+
+    elems :: GHC.Type -> ( Any, Any )
+    elems ty = ( Any $ GHC.eqType ty lhs, Any $ GHC.eqType ty rhs )
+
+-- | Compute whether given constraints imply that @ ( lhs == rhs ) ~ False $.
+lookupGivenUnEq :: [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type -> Bool
+lookupGivenUnEq tyConApps lhs rhs = any uneqEvidence tyConApps
+  where
+    -- Check whether there exists a component that contains both:
+    --
+    --  - an equality @ x == y @, with either @ x ~ lhs @ and @ y ~ rhs @ or @ x ~ rhs @ and @ y ~ lhs @.
+    --  - the constant @ False @.
+    uneqEvidence :: ( Set GHC.Type, Set TyConApp ) -> Bool
+    uneqEvidence ( tys, apps ) =
+      any
+          ( \case
+              Eq _ x y
+                |   ( GHC.eqType x lhs || lookupGivenEq tyConApps x lhs ) && ( GHC.eqType y rhs || lookupGivenEq tyConApps y rhs )
+                ||  ( GHC.eqType x rhs || lookupGivenEq tyConApps x rhs ) && ( GHC.eqType y lhs || lookupGivenEq tyConApps y lhs )
+                -> True
+              _ -> False
+          )
+          apps
+      &&
+      ( any
+          ( \case
+              GHC.TyConApp tyCon []
+                | tyCon == GHC.promotedFalseDataCon
+                -> True
+              _ -> False
+          )
+          tys
+      || any ( \case { Boolean False -> True; _ -> False } ) apps
+      )
 
 --------------------------------------------------------------------------------
 -- Solver part of the plugin.
@@ -482,7 +478,7 @@ tcPluginSolve :: PluginDefs -> [ GHC.Ct ] -> [ GHC.Ct ] -> [ GHC.Ct ] -> GHC.TcP
 tcPluginSolve _defs _givens _deriveds []      = pure $ GHC.TcPluginOk [] []
 tcPluginSolve  defs  givens  deriveds wanteds = do
   let
-    tyConApps :: Map GHC.TcTyVar ( Set TyConApp )
+    tyConApps :: [ ( Set GHC.Type, Set TyConApp ) ]
     tyConApps
       = GHC.pprTrace "Givens:"   ( GHC.ppr givens   )
       . GHC.pprTrace "Deriveds:" ( GHC.ppr deriveds )
@@ -522,7 +518,7 @@ pattern Ignore = Unsolved []
 -- This function currently never directly solves the constraint,
 -- but might make progress (emitting new given constraints),
 -- which hopefully will allow GHC to solve it.
-solveWanted :: PluginDefs -> [ GHC.Ct ] -> Map GHC.TcTyVar ( Set TyConApp ) -> [ GHC.Ct ] -> GHC.Ct -> GHC.TcPluginM SolverResult
+solveWanted :: PluginDefs -> [ GHC.Ct ] -> [ ( Set GHC.Type, Set TyConApp ) ] -> [ GHC.Ct ] -> GHC.Ct -> GHC.TcPluginM SolverResult
 solveWanted pluginDefs givens tyConApps _deriveds wanted =
   case GHC.classifyPredType ( GHC.ctPred wanted ) of
     GHC.EqPred GHC.NomEq lhs rhs -> do
