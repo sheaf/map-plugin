@@ -50,8 +50,8 @@ pass4 :: ( s ~ Delete k m, Lookup k m ~ Just v )
       -> Dict ( m ~ Insert k v s )
 pass4 _ _ _ _ = Dict
 
--- @ Delete k ( Insert k v m ) = m @ when @ Lookup k m = Nothing @.
-pass5 :: ( s ~ Insert k v m, Lookup k s ~ Nothing )
+-- @ Delete k ( Insert k v m ) = m @.
+pass5 :: ( s ~ Insert k v m, Lookup k m ~ Nothing )
       => Proxy k -> Proxy v -> Proxy s -> Proxy m
       -> Dict ( m ~ Delete k s )
 pass5 _ _ _ _ = Dict

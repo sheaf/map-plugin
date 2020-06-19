@@ -193,13 +193,14 @@ instance Eq  GHC.Type where
 instance Ord GHC.Type where
   compare = GHC.nonDetCmpType
 
+-- | Types that are going to be handled by the plugin.
 data TyConApp
-  = Eq      !GHC.Kind !GHC.Type !GHC.Type -- ^ 'Data.Type.Equality.=='
-  | Boolean !Bool
-  | Maybe   !GHC.Kind !( Maybe GHC.Type )
-  | Lookup  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type
-  | Insert  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type !GHC.Type
-  | Delete  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type
+  = Eq      !GHC.Kind !GHC.Type !GHC.Type                     -- ^ 'Data.Type.Equality.=='
+  | Boolean !Bool                                             -- ^ A promoted Boolean type, @ 'True @ or @ 'False @.
+  | Maybe   !GHC.Kind !( Maybe GHC.Type )                     -- ^ A promoted 'Maybe' type.
+  | Lookup  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type           -- ^ @ Lookup k m @.
+  | Insert  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type !GHC.Type -- ^ @ Insert k v m @.
+  | Delete  !GHC.Kind !GHC.Kind !GHC.Type !GHC.Type           -- @ Delete k m @.
   -- others: todo
   deriving stock ( Eq, Ord )
 
@@ -270,7 +271,7 @@ recogniseTyConApps pluginDefs givens =
   where
     comps     :: [ Set GHC.Type ]
     basicApps :: [ ( GHC.TcTyVar, TyConApp ) ]
-    ( comps, basicApps ) = first sccs $ recogniseGivenTyConApps pluginDefs givens
+    ( comps, basicApps ) = first ccs $ recogniseGivenTyConApps pluginDefs givens
 
     tyConApps :: GHC.Type -> Set TyConApp
     tyConApps ty =
@@ -293,17 +294,19 @@ recogniseTyConApps pluginDefs givens =
       in
         apps
 
+-- | Compute connected components of an undirected graph with the given set of edges.
+ccs :: Ord a => [ ( a, a ) ] -> [ Set a ]
+ccs = Partition.nontrivialSets
+    . Partition.fromSets
+    . map ( \ ( x, y ) -> Set.fromList [x,y] )
 
-sccs :: Ord a => [ ( a, a ) ] -> [ Set a ]
-sccs = Partition.nontrivialSets
-     . Partition.fromSets
-     . map ( \ ( x, y ) -> Set.fromList [x,y] )
-
+-- | Recognises all the 'TyConApp values associated to a type,
+-- either explicitly or by looking it up using the givens.
 recognise :: PluginDefs -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> Set TyConApp
 recognise pluginDefs tyConApps ty
   | GHC.TyConApp tyCon args <- ty
   , Just app <- recogniseExplicitTyConApp pluginDefs tyCon args
-  = Set.insert app ( go tyConApps )
+  = Set.singleton app
   | otherwise
   = go tyConApps
   where
@@ -322,6 +325,7 @@ recognise pluginDefs tyConApps ty
 simplify :: PluginDefs -> [ GHC.Ct ] -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Ct -> GHC.Type -> GHC.TcPluginM [ GHC.Ct ]
 simplify pluginDefs _givens tyConApps wanted ty =
   coerce $ ( `foldMap` ty_apps ) \case
+      -- Simplify @ Lookup k kvs @.
       Lookup kind_k kind_v k kvs -> Ap $ do
         let
           simpls :: Set GHC.Type
@@ -329,6 +333,28 @@ simplify pluginDefs _givens tyConApps wanted ty =
             Set.map
               ( lookupSimplificationTy pluginDefs kind_k kind_v k )
               ( simplifyLookup pluginDefs tyConApps k kvs )
+        traverse
+          ( newDeducedGivenEq wanted ty )
+          ( toList simpls )
+      -- Simplify @ Insert k v kvs @.
+      Insert kind_k kind_v k v kvs -> Ap $ do
+        let
+          simpls :: Set GHC.Type
+          simpls =
+            Set.map
+              ( insertSimplificationTy pluginDefs kind_k kind_v k v )
+              ( simplifyInsert pluginDefs tyConApps k v kvs )
+        traverse
+          ( newDeducedGivenEq wanted ty )
+          ( toList simpls )
+      -- Simplify @ Delete k kvs @.
+      Delete kind_k kind_v k kvs -> Ap $ do
+        let
+          simpls :: Set GHC.Type
+          simpls =
+            Set.map
+              ( deleteSimplificationTy pluginDefs kind_k kind_v k )
+              ( simplifyDelete pluginDefs tyConApps k kvs )
         traverse
           ( newDeducedGivenEq wanted ty )
           ( toList simpls )
@@ -342,6 +368,9 @@ data TyFamAppSimplification arg res
   = SimplifyArg arg -- ^ Simplification of the last type family argument.
   | Result      res -- ^ Computation of the full type family application.
   deriving stock ( Eq, Ord )
+
+-----------------------------------------------
+-- Simplify @ Lookup k kvs @.
 
 -- | Tries to simplify a type family application @ Lookup k kvs @.
 simplifyLookup :: PluginDefs -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type
@@ -383,7 +412,7 @@ simplifyLookup pluginDefs tyConApps k0 kvs0 =
       _ -> Set.empty
 
 -- | Returns the type corresponding to the outcome of simplifying
--- an expression of the form @ Lookup k m @.
+-- an expression of the form @ Lookup k kvs @.
 lookupSimplificationTy :: PluginDefs -> GHC.Kind -> GHC.Kind -> GHC.Type
                        -> TyFamAppSimplification GHC.Type ( Maybe GHC.Type )
                        -> GHC.Type
@@ -391,6 +420,108 @@ lookupSimplificationTy ( PluginDefs { lookupTyCon } ) kind_k kind_v k simpl = ca
   SimplifyArg arg     -> GHC.mkTyConApp lookupTyCon [ kind_k, kind_v, k, arg ]
   Result ( Just res ) -> GHC.mkTyConApp GHC.promotedJustDataCon [ kind_v, res ]
   Result Nothing      -> GHC.mkTyConApp GHC.promotedNothingDataCon [ kind_v ]
+
+-----------------------------------------------
+-- Simplify @ Delete k kvs @.
+
+-- | Tries to simplify a type family application @ Delete k kvs @.
+simplifyDelete :: PluginDefs -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type
+               -> Set ( TyFamAppSimplification GHC.Type GHC.Type )
+simplifyDelete pluginDefs tyConApps k0 kvs0 = rulesSimpls <> lookupValueSimpls
+  where
+    rulesSimpls, lookupValueSimpls :: Set ( TyFamAppSimplification GHC.Type GHC.Type )
+    rulesSimpls =
+      ( `foldMap` ( recognise pluginDefs tyConApps kvs0 ) ) \case
+        Delete _kind_k _kind_v k1 kvs1
+          -- @ Delete k0 ( Delete k1 kvs1 ) ~ Delete k0 kvs1 @ when @ k0 ~ k1 @.
+          | Just True <- eqTy tyConApps k0 k1
+          -> Set.singleton ( SimplifyArg kvs1 )
+        Insert _kind_k _kind_v k1 _v1 kvs1
+          -- @ Delete k0 ( Insert k1 v1 kvs1 ) ~ kvs1 @ when @ k0 ~ k1 @.
+          | Just True <- eqTy tyConApps k0 k1
+          -> Set.singleton ( Result kvs1 )
+        _ -> Set.empty
+    lookupValueSimpls =
+      foldMap
+        ( \case
+          -- @ Delete k0 kvs0 ~ kvs0 @ when @ Lookup k0 kvs0 ~ Nothing @.
+          Nothing -> Set.singleton ( Result kvs0 )
+          _       -> Set.empty
+        )
+        ( queryLookup pluginDefs tyConApps k0 kvs0 )
+
+-- | Returns the type corresponding to the outcome of simplifying
+-- an expression of the form @ Delete k kvs @.
+deleteSimplificationTy :: PluginDefs -> GHC.Kind -> GHC.Kind -> GHC.Type
+                       -> TyFamAppSimplification GHC.Type GHC.Type
+                       -> GHC.Type
+deleteSimplificationTy ( PluginDefs { deleteTyCon } ) kind_k kind_v k simpl = case simpl of
+  SimplifyArg arg -> GHC.mkTyConApp deleteTyCon [ kind_k, kind_v, k, arg ]
+  Result      res -> res
+
+-----------------------------------------------
+-- Simplify @ Insert k v kvs @.
+
+-- | Tries to simplify a type family application @ Insert k v kvs @.
+simplifyInsert :: PluginDefs -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type -> GHC.Type
+               -> Set ( TyFamAppSimplification GHC.Type GHC.Type )
+simplifyInsert pluginDefs tyConApps k0 v0 kvs0 =
+  ( `foldMap` ( recognise pluginDefs tyConApps kvs0 ) ) \case
+    Delete _kind_k _kind_v k1 kvs1
+      -- @ Insert k0 v0 ( Delete k1 kvs1 ) ~ kvs1 @ when @ k0 ~ k1 @ and @ Lookup k1 kvs1 ~ Just v0 @.
+      | Just True <- eqTy tyConApps k0 k1
+      , any
+            ( \case
+                Just v1
+                  | Just True <- eqTy tyConApps v0 v1
+                  -> True
+                _ -> False
+            )
+            ( queryLookup pluginDefs tyConApps k1 kvs1 )
+      -> Set.singleton ( Result kvs1 )
+    _ -> Set.empty
+
+-- | Returns the type corresponding to the outcome of simplifying
+-- an expression of the form @ Insert k v kvs @.
+insertSimplificationTy :: PluginDefs -> GHC.Kind -> GHC.Kind -> GHC.Type -> GHC.Type
+                       -> TyFamAppSimplification GHC.Type GHC.Type
+                       -> GHC.Type
+insertSimplificationTy ( PluginDefs { insertTyCon } ) kind_k kind_v k v simpl = case simpl of
+  SimplifyArg arg -> GHC.mkTyConApp insertTyCon [ kind_k, kind_v, k, v, arg ]
+  Result      res -> res
+
+--------------------------------------------------------------------------------
+-- Querying the value of a lookup.
+
+-- | Try to compute @ Lookup k v @:
+--
+--   - see whether @ Lookup k v @ has a given value,
+--   - try to see whether @ Lookup k v @ simplifies to a value.
+queryLookup :: PluginDefs -> [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type
+            -> Set ( Maybe GHC.Type )
+queryLookup pluginDefs tyConApps k0 kvs0 =
+  let
+    res = foldMap ( \ ( _, apps ) -> getLookup apps ) tyConApps <> simplified
+  in
+    GHC.pprTrace ( "queryLookup" ) ( GHC.ppr ( k0, kvs0, res ) ) $ res
+
+  where
+    getLookup :: Set TyConApp -> Set ( Maybe GHC.Type )
+    getLookup apps =
+      ( \case { ( Any True, s ) -> s; _ -> Set.empty } ) $
+        ( `foldMap` apps ) \case
+        Lookup _kind_k' _kind_v' k' kvs'
+          | Just True <- eqTy tyConApps k'   k0
+          , Just True <- eqTy tyConApps kvs' kvs0
+          -> ( Any True , Set.empty          )
+        Maybe _kind_v' mbTy
+          -> ( Any False, Set.singleton mbTy )
+        _ -> mempty
+    simplified :: Set ( Maybe GHC.Type )
+    simplified =
+      foldMap
+        ( \case { Result res -> Set.singleton res; _ -> Set.empty } )
+        ( simplifyLookup pluginDefs tyConApps k0 kvs0 )
 
 --------------------------------------------------------------------------------
 -- Handling equalities.
@@ -401,7 +532,7 @@ newDeducedGivenEq :: GHC.Ct -> GHC.Type -> GHC.Type -> GHC.TcPluginM GHC.Ct
 newDeducedGivenEq ct lhs rhs = do
   let
     coercion :: GHC.Coercion
-    coercion = GHC.mkUnivCo ( GHC.PluginProv "Map-Plugin") GHC.Nominal lhs rhs
+    coercion = GHC.mkUnivCo ( GHC.PluginProv "Map-Plugin" ) GHC.Nominal lhs rhs
   evidence <-
     GHC.newGiven
       ( GHC.bumpCtLocDepth $ GHC.ctLoc ct )
@@ -416,13 +547,11 @@ newDeducedGivenEq ct lhs rhs = do
 --  - @ Nothing @: unknown at this stage.
 eqTy :: [ ( Set GHC.Type, Set TyConApp ) ] -> GHC.Type -> GHC.Type -> Maybe Bool
 eqTy tyConApps lhs rhs
-  | GHC.eqType lhs rhs
+  |  GHC.eqType lhs rhs
+  || lookupGivenEq tyConApps lhs rhs
   = Just True
-  | lookupGivenEq tyConApps lhs rhs
-  = Just True
-  | GHC.typesCantMatch [ ( lhs, rhs ) ]
-  = Just False
-  | lookupGivenUnEq tyConApps lhs rhs
+  |  GHC.typesCantMatch [ ( lhs, rhs ) ]
+  || lookupGivenUnEq tyConApps lhs rhs
   = Just False
   | otherwise
   = Nothing
