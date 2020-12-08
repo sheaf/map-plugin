@@ -43,7 +43,7 @@ library
 
   build-depends:
     ghc
-      ^>= 8.11.0,
+       >= 9.1.0 && < 9.3,
     containers
       ^>= 0.6.2.1,
     data-partition

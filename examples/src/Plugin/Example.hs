@@ -65,6 +65,10 @@ pass6 _ _ _ = Dict
 --------------------------------------------------------------------------------
 -- Should not type-check.
 
+-- 'fail1', 'fail3' and 'fail4' unexpectedly typecheck
+-- as the plugin is not even invoked
+-- (lack of constrained type families)
+
 -- @ Could not deduce Lookup k s ~ Nothing @
 fail1 :: ( m ~ Insert k v s )
       => Proxy k -> Proxy v -> Proxy s -> Proxy m

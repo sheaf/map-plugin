@@ -34,7 +34,7 @@ import Data.Set
 import qualified Data.Set
   as Set
     ( empty, fromList, insert
-    , map, singleton
+    , map, member, singleton
     )
 
 -- data-partition
@@ -82,12 +82,12 @@ import qualified GHC.Core.Type
 import qualified GHC.Core.Unify
   as GHC
     ( typesCantMatch )
-import qualified GHC.Driver.Finder
-  as GHC
-    ( FindResult(..) )
 import qualified GHC.Data.FastString
   as GHC
     ( fsLit )
+import qualified GHC.Driver.Ppr
+  as GHC
+    ( pprTrace )
 import qualified GHC.Plugins
   as GHC
     ( Plugin(..), defaultPlugin, purePlugin )
@@ -105,7 +105,8 @@ import qualified GHC.Tc.Types
     )
 import qualified GHC.Tc.Types.Constraint
   as GHC
-    ( Ct(..), ctPred, ctLoc
+    ( Ct(..), CanEqLHS(..)
+    , ctPred, ctLoc
     , bumpCtLocDepth, mkNonCanonical
     )
 import qualified GHC.Tc.Types.Evidence
@@ -114,12 +115,12 @@ import qualified GHC.Tc.Types.Evidence
 import qualified GHC.Types.Name.Occurrence
   as GHC
     ( mkDataOcc, mkTcOcc )
-import qualified GHC.Types.Var
+import qualified GHC.Unit.Finder
   as GHC
-    ( TcTyVar )
+    ( FindResult(..) )
 import qualified GHC.Utils.Outputable
   as GHC
-    ( Outputable(..), pprTrace, text ) --, pprPanic )
+    ( Outputable(..), text )
 import  GHC.Utils.Outputable
     ( (<+>) )
 
@@ -243,12 +244,15 @@ recogniseExplicitTyConApp ( PluginDefs { .. } ) tyCon args
   = Nothing
 
 -- | Recognise supported type family applications and equalities in the provided list of given constraints.
-recogniseGivenTyConApps :: PluginDefs -> [ GHC.Ct ] -> ( [ ( GHC.Type, GHC.Type ) ], [ ( GHC.TcTyVar, TyConApp ) ] )
+recogniseGivenTyConApps :: PluginDefs -> [ GHC.Ct ] -> ( [ ( GHC.Type, GHC.Type ) ], [ ( GHC.Type, TyConApp ) ] )
 recogniseGivenTyConApps pluginDefs = partitionEithers . mapMaybe \case
-  GHC.CFunEqCan { cc_fun, cc_tyargs, cc_fsk }
-    -> Right . ( cc_fsk, ) <$> recogniseExplicitTyConApp pluginDefs cc_fun cc_tyargs
-  GHC.CTyEqCan { cc_tyvar, cc_rhs }
-    -> Just $ Left ( GHC.TyVarTy cc_tyvar, cc_rhs )
+  GHC.CEqCan { cc_lhs, cc_rhs, cc_eq_rel }
+    | GHC.NomEq <- cc_eq_rel
+    -> case cc_lhs of
+          GHC.TyVarLHS tyvar ->
+            Just $ Left ( GHC.TyVarTy tyvar, cc_rhs )
+          GHC.TyFamLHS tycon tyargs ->
+            Right . ( cc_rhs, ) <$> recogniseExplicitTyConApp pluginDefs tycon tyargs
   _ -> Nothing
 
 -- | Recognise supported types:
@@ -270,8 +274,20 @@ recogniseTyConApps pluginDefs givens =
 
   where
     comps     :: [ Set GHC.Type ]
-    basicApps :: [ ( GHC.TcTyVar, TyConApp ) ]
-    ( comps, basicApps ) = first ccs $ recogniseGivenTyConApps pluginDefs givens
+    basicApps :: [ ( GHC.Type, TyConApp ) ]
+    ( comps, basicApps ) = first ( insertBasicAppTys . ccs ) $ recogniseGivenTyConApps pluginDefs givens
+
+
+    insertBasicAppTys :: [ Set GHC.Type ] -> [ Set GHC.Type ]
+    insertBasicAppTys = go ( map fst basicApps )
+      where
+        go :: [ GHC.Type ] -> [ Set GHC.Type ] -> [ Set GHC.Type ]
+        go []             tys = tys
+        go (appTy:appTys) tys
+          | any ( appTy `Set.member` ) tys
+          = go appTys tys
+          | otherwise
+          = Set.singleton appTy : go appTys tys
 
     tyConApps :: GHC.Type -> Set TyConApp
     tyConApps ty =
@@ -288,8 +304,8 @@ recogniseTyConApps pluginDefs givens =
             -> recogniseExplicitTyConApp pluginDefs tyCon args
           _ -> Nothing
         lookedUpApps :: Set TyConApp
-        lookedUpApps = Set.fromList $ ( `mapMaybe` basicApps ) \ ( tv, app ) -> do
-          guard ( GHC.eqType ty ( GHC.TyVarTy tv ) )
+        lookedUpApps = Set.fromList $ ( `mapMaybe` basicApps ) \ ( ty', app ) -> do
+          guard ( GHC.eqType ty ty' )
           pure app
       in
         apps
